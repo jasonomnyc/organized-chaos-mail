@@ -8,6 +8,7 @@ import { registerCalendarTools } from "./calendarTools.js";
 import { registerTools } from "./tools.js";
 import { registerTextTools } from "./textTools.js";
 import { registerInviteTools } from "./invite.js";
+import { registerUnsubscribeTools } from "./unsubscribe.js";
 import { registerSlackTools, finishSlackSignIn, slackRedirectUri, slackSummary } from "./slack.js";
 import { OwnerAuthProvider, passwordMatches } from "./ownerAuth.js";
 import { baseUrl } from "./auth/appKeys.js";
@@ -34,6 +35,7 @@ function buildMcpServer() {
     registerCalendarTools(server);
     registerTextTools(server);
     registerInviteTools(server);
+    registerUnsubscribeTools(server);
     registerSlackTools(server);
     return server;
 }

@@ -43,7 +43,9 @@ export function buildMime(msg) {
         ...files.map((f) => {
             const name = String(f.filename || "attachment").replace(/[\r\n"\\]/g, "_");
             const ascii = name.replace(/[^\x20-\x7e]/g, "_");
-            const type = String(f.mimeType || "application/octet-stream").replace(/[\r\n";]/g, "");
+            const rawType = String(f.mimeType || "application/octet-stream").replace(/[\r\n"]/g, "");
+            // Simple parameters like "text/calendar; method=REPLY" are kept; anything else is cut back to the bare type.
+            const type = /^[\w.+-]+\/[\w.+-]+(\s*;\s*[\w-]+=[\w.-]+)*$/.test(rawType) ? rawType : rawType.split(";")[0].trim();
             return (`Content-Type: ${type}; name="${encodeHeader(name)}"\r\n` +
                 `Content-Disposition: attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}\r\n` +
                 `Content-Transfer-Encoding: base64\r\n\r\n${wrap64(f.data)}`);

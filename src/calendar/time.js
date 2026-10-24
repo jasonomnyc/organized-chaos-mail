@@ -6,7 +6,11 @@ const HOUR = 3600_000;
 const DAY = 24 * HOUR;
 /** The time zone of this computer, e.g. "America/New_York". */
 export function localZone() {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    // On a cloud server the computer's zone is UTC, which isn't anyone's local time; use the owner's zone instead.
+    if (process.env.OWNER_TIME_ZONE)
+        return process.env.OWNER_TIME_ZONE;
+    const z = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return !z || /^(Etc\/)?(UTC|GMT|Universal|Zulu)$/i.test(z) ? "America/New_York" : z;
 }
 export function checkZone(tz) {
     const zone = tz?.trim() || localZone();

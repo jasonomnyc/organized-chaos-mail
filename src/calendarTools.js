@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { findAccount, loadConfig, requirePermission, } from "./config.js";
 import { calendarFor } from "./providers/index.js";
-import { addDays, checkZone, parseWhen, rangeOf, resolveRange, toMs } from "./calendar/time.js";
+import { addDays, checkZone, formatInZone, parseWhen, rangeOf, resolveRange, toMs } from "./calendar/time.js";
 import { othersOn } from "./calendar/types.js";
 import { inbox, ok, safe } from "./tools.js";
 const WEEK = 7 * 24 * 3600_000;
@@ -138,6 +138,17 @@ export function registerCalendarTools(server) {
                 .boolean()
                 .optional()
                 .describe("Add a Google Meet or Microsoft Teams link, where the account supports it."),
+            repeat: z
+                .enum(["daily", "weekdays", "weekly", "biweekly", "monthly", "yearly"])
+                .optional()
+                .describe("Make it a repeating event, starting on the start date, with no end."),
+            reminder_minutes: z
+                .number()
+                .int()
+                .min(0)
+                .max(40320)
+                .optional()
+                .describe("Phone/desktop reminder this many minutes before the start (0 = at the start time)."),
             calendar: calendarArg,
             time_zone: timeZoneArg,
         },
@@ -146,15 +157,19 @@ export function registerCalendarTools(server) {
         const tz = checkZone(args.time_zone);
         const invites = !!(args.attendees?.length || args.optional_attendees?.length);
         const { account, cal } = await openCalendar(args.inbox, invites ? "send" : "draft", invites ? "send calendar invitations" : "add calendar events");
+        const range = resolveRange(args.start, args.end, tz);
         const event = await cal.createEvent(args.calendar, {
             title: args.title,
-            range: resolveRange(args.start, args.end, tz),
+            range,
             timeZone: tz,
             location: args.location,
             description: args.description,
             attendees: args.attendees,
             optionalAttendees: args.optional_attendees,
             videoCall: args.add_video_call,
+            repeat: args.repeat,
+            repeatDate: range.start.allDay ? range.start.date : formatInZone(range.start.ms, tz).slice(0, 10),
+            reminderMinutes: args.reminder_minutes,
         });
         return ok({ inbox: account.nickname, time_zone: tz, invitations_sent: invites, event });
     }));

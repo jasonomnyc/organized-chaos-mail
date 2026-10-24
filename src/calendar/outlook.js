@@ -139,6 +139,10 @@ export class OutlookCalendar {
                 location: event.location ? { displayName: event.location } : undefined,
                 attendees,
                 ...(event.videoCall ? { isOnlineMeeting: true } : {}),
+                ...(event.repeat ? { recurrence: graphRecurrence(event.repeat, event.repeatDate) } : {}),
+                ...(event.reminderMinutes !== undefined
+                    ? { isReminderOn: true, reminderMinutesBeforeStart: event.reminderMinutes }
+                    : {}),
             },
         });
         return this.toEvent(created, id, event.timeZone, MAX_DESCRIPTION_CHARS);
@@ -262,3 +266,20 @@ function fromGraphTime(t, allDay, tz, isEnd) {
     return formatInZone(Date.parse(t.dateTime.slice(0, 19) + "Z"), tz);
 }
 //# sourceMappingURL=outlook.js.map
+
+const W_DAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+/** A Graph recurrence for one of the simple repeat choices, with no end date. */
+function graphRecurrence(repeat, start) {
+    const startDate = start;
+    const d = new Date(`${startDate}T12:00:00Z`);
+    const day = W_DAYS[d.getUTCDay()];
+    const range = { type: "noEnd", startDate };
+    switch (repeat) {
+        case "daily": return { pattern: { type: "daily", interval: 1 }, range };
+        case "weekdays": return { pattern: { type: "weekly", interval: 1, daysOfWeek: W_DAYS.slice(1, 6), firstDayOfWeek: "sunday" }, range };
+        case "weekly": return { pattern: { type: "weekly", interval: 1, daysOfWeek: [day], firstDayOfWeek: "sunday" }, range };
+        case "biweekly": return { pattern: { type: "weekly", interval: 2, daysOfWeek: [day], firstDayOfWeek: "sunday" }, range };
+        case "monthly": return { pattern: { type: "absoluteMonthly", interval: 1, dayOfMonth: d.getUTCDate() }, range };
+        default: return { pattern: { type: "absoluteYearly", interval: 1, dayOfMonth: d.getUTCDate(), month: d.getUTCMonth() + 1 }, range };
+    }
+}

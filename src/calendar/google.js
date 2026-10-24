@@ -105,6 +105,10 @@ export class GoogleCalendar {
                 start: toGTime(event.range.start, event.timeZone, false),
                 end: toGTime(event.range.end, event.timeZone, true),
                 attendees: attendees.length ? attendees : undefined,
+                recurrence: event.repeat ? [gRule(event.repeat, event.repeatDate)] : undefined,
+                reminders: event.reminderMinutes !== undefined
+                    ? { useDefault: false, overrides: [{ method: "popup", minutes: event.reminderMinutes }] }
+                    : undefined,
                 conferenceData: event.videoCall
                     ? {
                         createRequest: {
@@ -250,3 +254,18 @@ function readableError(err) {
     return new Error(`Google returned an error${status ? ` (${status})` : ""}: ${message}`);
 }
 //# sourceMappingURL=google.js.map
+
+const G_DAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+/** An RRULE for one of the simple repeat choices. */
+function gRule(repeat, start) {
+    const d = start ? new Date(`${start}T12:00:00Z`) : null;
+    const day = d && !isNaN(d) ? G_DAYS[d.getUTCDay()] : null;
+    switch (repeat) {
+        case "daily": return "RRULE:FREQ=DAILY";
+        case "weekdays": return "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR";
+        case "weekly": return "RRULE:FREQ=WEEKLY" + (day ? `;BYDAY=${day}` : "");
+        case "biweekly": return "RRULE:FREQ=WEEKLY;INTERVAL=2" + (day ? `;BYDAY=${day}` : "");
+        case "monthly": return "RRULE:FREQ=MONTHLY";
+        default: return "RRULE:FREQ=YEARLY";
+    }
+}

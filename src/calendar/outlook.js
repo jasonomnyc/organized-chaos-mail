@@ -133,13 +133,15 @@ export class OutlookCalendar {
             body: {
                 subject: event.title,
                 body: { contentType: "Text", content: event.description ?? "" },
-                start: toGraphTime(event.range.start, false),
-                end: toGraphTime(event.range.end, true),
+                // A repeating series is pinned to local time, so its weekday and clock time stay right
+                // in the evening and across daylight saving changes.
+                start: event.repeat ? toGraphLocal(event.range.start, event.timeZone, false) : toGraphTime(event.range.start, false),
+                end: event.repeat ? toGraphLocal(event.range.end, event.timeZone, true) : toGraphTime(event.range.end, true),
                 isAllDay: event.range.start.allDay,
                 location: event.location ? { displayName: event.location } : undefined,
                 attendees,
                 ...(event.videoCall ? { isOnlineMeeting: true } : {}),
-                ...(event.repeat ? { recurrence: graphRecurrence(event.repeat, event.repeatDate) } : {}),
+                ...(event.repeat ? { recurrence: graphRecurrence(event.repeat, event.repeatDate, event.timeZone) } : {}),
                 ...(event.reminderMinutes !== undefined
                     ? { isReminderOn: true, reminderMinutesBeforeStart: event.reminderMinutes }
                     : {}),
@@ -259,6 +261,11 @@ function toGraphTime(when, isEnd) {
     }
     return { dateTime: new Date(when.ms).toISOString().slice(0, 19), timeZone: "UTC" };
 }
+function toGraphLocal(when, tz, isEnd) {
+    if (when.allDay || !tz)
+        return toGraphTime(when, isEnd);
+    return { dateTime: formatInZone(when.ms, tz).slice(0, 19), timeZone: tz };
+}
 function fromGraphTime(t, allDay, tz, isEnd) {
     const date = t.dateTime.slice(0, 10);
     if (allDay)
@@ -269,11 +276,11 @@ function fromGraphTime(t, allDay, tz, isEnd) {
 
 const W_DAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
 /** A Graph recurrence for one of the simple repeat choices, with no end date. */
-function graphRecurrence(repeat, start) {
+function graphRecurrence(repeat, start, timeZone) {
     const startDate = start;
     const d = new Date(`${startDate}T12:00:00Z`);
     const day = W_DAYS[d.getUTCDay()];
-    const range = { type: "noEnd", startDate };
+    const range = { type: "noEnd", startDate, ...(timeZone ? { recurrenceTimeZone: timeZone } : {}) };
     switch (repeat) {
         case "daily": return { pattern: { type: "daily", interval: 1 }, range };
         case "weekdays": return { pattern: { type: "weekly", interval: 1, daysOfWeek: W_DAYS.slice(1, 6), firstDayOfWeek: "sunday" }, range };

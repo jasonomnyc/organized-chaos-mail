@@ -1,5 +1,5 @@
 import { GraphError, graphRequest } from "../providers/outlook.js";
-import { addDays, formatInZone } from "./time.js";
+import { addDays, formatInZone, toMs } from "./time.js";
 import { clip, LIST_DESCRIPTION_CHARS, MAX_DESCRIPTION_CHARS, people, } from "./types.js";
 const LIST_FIELDS = [
     "id",
@@ -270,6 +270,11 @@ function fromGraphTime(t, allDay, tz, isEnd) {
     const date = t.dateTime.slice(0, 10);
     if (allDay)
         return isEnd ? addDays(date, -1) : date;
+    // Times normally come back in UTC; a few answers (like a newly made repeating event) use the event's own zone.
+    const zone = t.timeZone && !/^(UTC|Etc\/UTC|tzone:\/\/Microsoft\/Utc)$/i.test(t.timeZone) ? t.timeZone : null;
+    if (zone) {
+        try { return formatInZone(toMs(t.dateTime.slice(0, 19), zone), tz); } catch { /* not a zone name we know */ }
+    }
     return formatInZone(Date.parse(t.dateTime.slice(0, 19) + "Z"), tz);
 }
 //# sourceMappingURL=outlook.js.map

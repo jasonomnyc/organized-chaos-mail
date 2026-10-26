@@ -279,26 +279,70 @@ async function channelUnreads(w) {
     if (u.running) await Promise.race([u.running, new Promise((r) => setTimeout(r, 20000))]);
     return u.list ?? [];
 }
-async function scanChannelUnreads(w) {
-    const c = wsCache(w);
-    const chans = (await conversations(w)).filter((x) => !x.is_im);
+/** Slack now allows apps like this only about one conversations.history / replies call a minute, so messages are
+ *  read through search instead (a separate, much higher limit). Thread replies are told apart by their link. */
+function threadOfMatch(m) {
+    if (m.thread_ts) return m.thread_ts;
+    const t = /[?&]thread_ts=([\d.]+)/.exec(m.permalink || "");
+    return t && t[1] !== m.ts ? t[1] : undefined;
+}
+async function searchConversation(w, id, { count = 60, after, threadTs } = {}) {
+    const q = `in:<#${id}>` + (after ? ` after:${after}` : "");
     const out = [];
-    for (let i = 0; i < chans.length; i += 3) {
-        const part = await Promise.all(chans.slice(i, i + 3).map(async (ch) => {
+    for (let page = 1; page <= 2 && out.length < count; page++) {
+        const r = await api(w, "search.messages", { query: q, sort: "timestamp", sort_dir: "desc", count: 100, page });
+        const matches = r?.messages?.matches || [];
+        for (const m of matches) {
+            if (m.channel?.id && m.channel.id !== id) continue;
+            const th = threadOfMatch(m);
+            if (threadTs ? !(m.ts === threadTs || th === threadTs) : !!th) continue;
+            out.push({ ...m, thread_ts: th });
+            if (out.length >= count) break;
+        }
+        if (matches.length < 100) break;
+    }
+    return out;
+}
+const dayBefore = (ts) => new Date(Number(ts) * 1000 - 864e5).toISOString().slice(0, 10);
+async function scanChannelUnreads(w) {
+    const chans = (await conversations(w)).filter((x) => !x.is_im);
+    // Where you last read each channel (conversations.info isn't affected by the history limit).
+    const lastRead = new Map();
+    for (let i = 0; i < chans.length; i += 4) {
+        await Promise.all(chans.slice(i, i + 4).map(async (ch) => {
             const info = await api(w, "conversations.info", { channel: ch.id }).catch(() => null);
-            const lastRead = info?.channel?.last_read;
-            if (!lastRead) return null;
-            const h = await api(w, "conversations.history", { channel: ch.id, oldest: lastRead, limit: 50 }).catch(() => null);
-            const msgs = (h?.messages || []).filter((m) => Number(m.ts) > Number(lastRead) && m.user !== w.userId && (!m.subtype || m.subtype === "bot_message" || m.subtype === "file_share" || m.subtype === "thread_broadcast"));
-            if (!msgs.length) return null;
-            const label = ch.is_mpim ? await convLabel(w, ch) : `#${ch.name}`;
-            const items = await Promise.all(msgs.slice(0, 10).map(async (m) => ({ ...(await shapeMessage(w, m, label)), kind: ch.is_mpim ? "group_dm" : "channel", channel_id: ch.id, link: await permalink(w, ch.id, m.ts, m.thread_ts) })));
-            return { channel_id: ch.id, name: label, mpim: !!ch.is_mpim, private: !!ch.is_private, unread: msgs.length, more: !!h?.has_more, last_read: lastRead, latest_ts: msgs[0].ts, items };
+            if (info?.channel?.last_read) lastRead.set(ch.id, info.channel.last_read);
         }));
-        out.push(...part.filter(Boolean));
+    }
+    if (!lastRead.size) return [];
+    // One search for everything other people posted since the oldest of those (capped at 14 days back).
+    const reads = [...lastRead.values()].map(Number).filter((x) => x > 0);
+    const twoWeeks = Date.now() / 1000 - 14 * 86400;
+    const floor = reads.length ? Math.max(Math.min(...reads), twoWeeks) : twoWeeks;
+    const byChan = new Map();
+    let capped = false;
+    for (let page = 1; page <= 3; page++) {
+        const r = await api(w, "search.messages", { query: `-from:me after:${dayBefore(floor)}`, sort: "timestamp", sort_dir: "desc", count: 100, page }).catch(() => null);
+        const matches = r?.messages?.matches || [];
+        for (const m of matches) {
+            const id = m.channel?.id;
+            if (!id || !lastRead.has(id) || m.user === w.userId || threadOfMatch(m)) continue;
+            if (Number(m.ts) <= Number(lastRead.get(id))) continue;
+            if (!byChan.has(id)) byChan.set(id, []);
+            byChan.get(id).push(m);
+        }
+        if (matches.length < 100) break;
+        if (page === 3) capped = true;
+    }
+    const out = [];
+    for (const [id, msgs] of byChan) {
+        const ch = chans.find((x) => x.id === id);
+        if (!ch) continue;
+        const label = ch.is_mpim ? await convLabel(w, ch) : `#${ch.name}`;
+        const items = await Promise.all(msgs.slice(0, 10).map(async (m) => ({ ...(await shapeMessage(w, m, label)), kind: ch.is_mpim ? "group_dm" : "channel", channel_id: id, link: m.permalink || await permalink(w, id, m.ts) })));
+        out.push({ channel_id: id, name: label, mpim: !!ch.is_mpim, private: !!ch.is_private, unread: msgs.length, more: capped || msgs.length > 10, last_read: lastRead.get(id), latest_ts: msgs[0].ts, items });
     }
     out.sort((a, b) => Number(b.latest_ts) - Number(a.latest_ts));
-    void c;
     return out;
 }
 async function shapeMessage(w, m, channelLabel) {
@@ -492,14 +536,24 @@ export function registerSlackTools(server) {
         const s = await loadStore();
         const w = findWorkspace(s, nick);
         const id = await resolveChannel(w, channel);
-        const r = thread_ts
-            ? await api(w, "conversations.replies", { channel: id, ts: thread_ts, limit: limit ?? 50 })
-            : await api(w, "conversations.history", { channel: id, limit: limit ?? 30, oldest: since_minutes ? sinceTs(since_minutes) : undefined });
+        let r;
+        try {
+            const after = since_minutes ? dayBefore(sinceTs(since_minutes)) : thread_ts ? dayBefore(thread_ts) : undefined;
+            let found = await searchConversation(w, id, { count: limit ?? 30, after, threadTs: thread_ts });
+            if (since_minutes) found = found.filter((m) => Number(m.ts) >= Number(sinceTs(since_minutes)));
+            r = { messages: found };
+            if (!found.length) throw new Error("nothing found by search");
+        }
+        catch {
+            // Brand-new messages can take a moment to reach search; fall back to the (rate-limited) direct read.
+            r = thread_ts
+                ? await api(w, "conversations.replies", { channel: id, ts: thread_ts, limit: limit ?? 50 }).catch(() => r || { messages: [] })
+                : await api(w, "conversations.history", { channel: id, limit: Math.min(limit ?? 30, 15), oldest: since_minutes ? sinceTs(since_minutes) : undefined }).catch(() => r || { messages: [] });
+        }
         const ch = (await conversations(w)).find((c) => c.id === id);
         const label = ch ? await convLabel(w, ch) : id;
-        const msgs = await Promise.all((r.messages || []).map((m) => shapeMessage(w, m, label)));
+        const msgs = await Promise.all((r.messages || []).map(async (m) => ({ ...(await shapeMessage(w, m, label)), link: m.permalink || await permalink(w, id, m.ts, m.thread_ts || thread_ts) })));
         msgs.sort((a, b) => Number(a.ts) - Number(b.ts));
-        await Promise.all(msgs.map(async (m) => { m.link = await permalink(w, id, m.ts, m.thread_ts || thread_ts); }));
         let marked;
         if (mark_read) {
             const latest = thread_ts ? null : (r.messages || []).reduce((a, m) => (Number(m.ts) > Number(a || 0) ? m.ts : a), null);

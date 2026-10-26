@@ -142,11 +142,12 @@ async function api(w, method, params = {}, post = false) {
                 method: "POST",
                 headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=utf-8" },
                 body: JSON.stringify(clean),
+                signal: AbortSignal.timeout(15000),
             })
-            : await fetch(`https://slack.com/api/${method}?${new URLSearchParams(clean)}`, { headers: { Authorization: `Bearer ${token}` } });
-        if (res.status === 429 && attempt < 3) {
+            : await fetch(`https://slack.com/api/${method}?${new URLSearchParams(clean)}`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15000) });
+        if (res.status === 429 && attempt < 1) {
             const wait = Number(res.headers.get("retry-after") || 2);
-            await new Promise((r) => setTimeout(r, Math.min(10, wait) * 1000));
+            await new Promise((r) => setTimeout(r, Math.min(5, wait) * 1000));
             continue;
         }
         const data = await res.json().catch(() => ({ ok: false, error: `http_${res.status}` }));
@@ -280,7 +281,7 @@ async function channelUnreads(w) {
 }
 async function scanChannelUnreads(w) {
     const c = wsCache(w);
-    const chans = (await conversations(w)).filter((x) => !x.is_im && !x.is_mpim);
+    const chans = (await conversations(w)).filter((x) => !x.is_im);
     const out = [];
     for (let i = 0; i < chans.length; i += 3) {
         const part = await Promise.all(chans.slice(i, i + 3).map(async (ch) => {
@@ -290,9 +291,9 @@ async function scanChannelUnreads(w) {
             const h = await api(w, "conversations.history", { channel: ch.id, oldest: lastRead, limit: 50 }).catch(() => null);
             const msgs = (h?.messages || []).filter((m) => Number(m.ts) > Number(lastRead) && m.user !== w.userId && (!m.subtype || m.subtype === "bot_message" || m.subtype === "file_share" || m.subtype === "thread_broadcast"));
             if (!msgs.length) return null;
-            const label = `#${ch.name}`;
-            const items = await Promise.all(msgs.slice(0, 10).map(async (m) => ({ ...(await shapeMessage(w, m, label)), kind: "channel", channel_id: ch.id, link: await permalink(w, ch.id, m.ts, m.thread_ts) })));
-            return { channel_id: ch.id, name: label, private: !!ch.is_private, unread: msgs.length, more: !!h?.has_more, last_read: lastRead, latest_ts: msgs[0].ts, items };
+            const label = ch.is_mpim ? await convLabel(w, ch) : `#${ch.name}`;
+            const items = await Promise.all(msgs.slice(0, 10).map(async (m) => ({ ...(await shapeMessage(w, m, label)), kind: ch.is_mpim ? "group_dm" : "channel", channel_id: ch.id, link: await permalink(w, ch.id, m.ts, m.thread_ts) })));
+            return { channel_id: ch.id, name: label, mpim: !!ch.is_mpim, private: !!ch.is_private, unread: msgs.length, more: !!h?.has_more, last_read: lastRead, latest_ts: msgs[0].ts, items };
         }));
         out.push(...part.filter(Boolean));
     }
@@ -414,16 +415,6 @@ export function registerSlackTools(server) {
                     const last = matches[matches.length - 1];
                     if (matches.length < 100 || !last || Number(last.ts) < Number(oldest)) break;
                 }
-                // Group DMs are few, so they're read directly as well (search may not list them).
-                const seen = new Set(out.map((x) => x.channel_id + "|" + x.ts));
-                for (const c of chans.filter((x) => x.is_mpim).slice(0, 20)) {
-                    const r = await api(w, "conversations.history", { channel: c.id, oldest, limit: 30 }).catch(() => ({ messages: [] }));
-                    const label = await convLabel(w, c);
-                    for (const m of r.messages || []) {
-                        if (!m.user || m.user === w.userId || m.subtype || seen.has(c.id + "|" + m.ts)) continue;
-                        out.push({ ...(await shapeMessage(w, { ...m }, label)), kind: "group_dm", channel_id: c.id, link: await permalink(w, c.id, m.ts, m.thread_ts) });
-                    }
-                }
                 // @mentions in channels (found through search, which covers every channel you're in).
                 const after = new Date(Date.now() - mins * 60000 - 864e5).toISOString().slice(0, 10);
                 const sr = await api(w, "search.messages", { query: `<@${w.userId}> after:${after}`, sort: "timestamp", sort_dir: "desc", count: 50 }).catch(() => null);
@@ -432,8 +423,15 @@ export function registerSlackTools(server) {
                     if (m.channel?.is_im || m.channel?.is_mpim) continue;
                     out.push({ ...(await shapeMessage(w, m, m.channel?.name ? `#${m.channel.name}` : "a channel")), kind: "mention", channel_id: m.channel?.id, link: m.permalink });
                 }
+                const scan = include_channels ? await channelUnreads(w).catch((e) => ({ error: e.message })) : undefined;
+                let channels = scan;
+                if (Array.isArray(scan)) {
+                    // Group DMs come from the background scan (unread ones), so they never slow this down.
+                    const seen = new Set(out.map((x) => x.channel_id + "|" + x.ts));
+                    for (const g of scan.filter((x) => x.mpim)) for (const m of g.items) if (!seen.has(m.channel_id + "|" + m.ts) && Number(m.ts) >= Number(oldest)) out.push({ ...m, kind: "group_dm" });
+                    channels = scan.filter((x) => !x.mpim);
+                }
                 out.sort((a, b) => Number(b.ts) - Number(a.ts));
-                const channels = include_channels ? await channelUnreads(w).catch((e) => ({ error: e.message })) : undefined;
                 return { workspace: w.nickname, items: out, ...(channels ? (Array.isArray(channels) ? { channels } : { channels_error: channels.error }) : {}) };
             }
             catch (err) {

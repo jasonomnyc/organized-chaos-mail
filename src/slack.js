@@ -146,7 +146,7 @@ async function api(w, method, params = {}, post = false) {
             : await fetch(`https://slack.com/api/${method}?${new URLSearchParams(clean)}`, { headers: { Authorization: `Bearer ${token}` } });
         if (res.status === 429 && attempt < 3) {
             const wait = Number(res.headers.get("retry-after") || 2);
-            await new Promise((r) => setTimeout(r, Math.min(30, wait) * 1000));
+            await new Promise((r) => setTimeout(r, Math.min(10, wait) * 1000));
             continue;
         }
         const data = await res.json().catch(() => ({ ok: false, error: `http_${res.status}` }));
@@ -266,13 +266,24 @@ async function permalink(w, channel, ts, threadTs) {
     return threadTs && threadTs !== ts ? `${p}?thread_ts=${threadTs}&cid=${channel}` : p;
 }
 /** Unread messages in each channel you're in (not DMs), newest first, from where you last read. */
+/** Channel unreads come from a background check that runs at most once a minute; callers wait up to 20 seconds and
+ *  otherwise get the last finished result, so a slow or rate-limited Slack never holds up DMs and mentions. */
+const unreadState = new Map();
 async function channelUnreads(w) {
+    let u = unreadState.get(w.id);
+    if (!u) { u = { list: null, at: 0, running: null }; unreadState.set(w.id, u); }
+    if (!u.running && Date.now() - u.at > 60000) {
+        u.running = scanChannelUnreads(w).then((list) => { u.list = list; u.at = Date.now(); }).catch(() => { u.at = Date.now(); }).finally(() => { u.running = null; });
+    }
+    if (u.running) await Promise.race([u.running, new Promise((r) => setTimeout(r, 20000))]);
+    return u.list ?? [];
+}
+async function scanChannelUnreads(w) {
     const c = wsCache(w);
-    if (c.unread && Date.now() - c.unread.at < 60000) return c.unread.list;
     const chans = (await conversations(w)).filter((x) => !x.is_im && !x.is_mpim);
     const out = [];
-    for (let i = 0; i < chans.length; i += 6) {
-        const part = await Promise.all(chans.slice(i, i + 6).map(async (ch) => {
+    for (let i = 0; i < chans.length; i += 3) {
+        const part = await Promise.all(chans.slice(i, i + 3).map(async (ch) => {
             const info = await api(w, "conversations.info", { channel: ch.id }).catch(() => null);
             const lastRead = info?.channel?.last_read;
             if (!lastRead) return null;
@@ -286,7 +297,7 @@ async function channelUnreads(w) {
         out.push(...part.filter(Boolean));
     }
     out.sort((a, b) => Number(b.latest_ts) - Number(a.latest_ts));
-    c.unread = { at: Date.now(), list: out };
+    void c;
     return out;
 }
 async function shapeMessage(w, m, channelLabel) {
@@ -386,18 +397,32 @@ export function registerSlackTools(server) {
         const oldest = sinceTs(mins);
         const results = await Promise.all(targets(s, nick).map(async (w) => {
             try {
-                const chans = await conversations(w);
-                const dms = chans.filter((c) => c.is_im || c.is_mpim);
+                // Direct and group messages to you, found with one search (checking every DM one by one is slow and gets rate limited).
                 const out = [];
-                // Direct and group messages from other people.
-                for (let i = 0; i < dms.length; i += 8) {
-                    const batch = await Promise.all(dms.slice(i, i + 8).map(async (c) => {
-                        const r = await api(w, "conversations.history", { channel: c.id, oldest, limit: 30 }).catch(() => ({ messages: [] }));
-                        const label = await convLabel(w, c);
-                        return Promise.all((r.messages || []).filter((m) => m.user && m.user !== w.userId && !m.subtype)
-                            .map((m) => shapeMessage(w, { ...m }, label).then(async (x) => ({ ...x, kind: c.is_im ? "dm" : "group_dm", channel_id: c.id, link: await permalink(w, c.id, m.ts, m.thread_ts) }))));
-                    }));
-                    out.push(...batch.flat());
+                const day = new Date(Date.now() - mins * 60000 - 864e5).toISOString().slice(0, 10);
+                const chans = await conversations(w).catch(() => []);
+                for (let page = 1; page <= 3; page++) {
+                    const dr = await api(w, "search.messages", { query: `to:me after:${day}`, sort: "timestamp", sort_dir: "desc", count: 100, page });
+                    const matches = dr?.messages?.matches || [];
+                    for (const m of matches) {
+                        if (Number(m.ts) < Number(oldest) || m.user === w.userId || !m.channel?.id) continue;
+                        if (!(m.channel.is_im || m.channel.is_mpim || String(m.channel.id).startsWith("D"))) continue;
+                        const ch = chans.find((c) => c.id === m.channel.id);
+                        const label = ch ? await convLabel(w, ch) : m.channel.is_mpim ? "Group DM" : `DM with ${(await userName(w, m.user)).name}`;
+                        out.push({ ...(await shapeMessage(w, m, label)), kind: m.channel.is_mpim || ch?.is_mpim ? "group_dm" : "dm", channel_id: m.channel.id, link: m.permalink || await permalink(w, m.channel.id, m.ts) });
+                    }
+                    const last = matches[matches.length - 1];
+                    if (matches.length < 100 || !last || Number(last.ts) < Number(oldest)) break;
+                }
+                // Group DMs are few, so they're read directly as well (search may not list them).
+                const seen = new Set(out.map((x) => x.channel_id + "|" + x.ts));
+                for (const c of chans.filter((x) => x.is_mpim).slice(0, 20)) {
+                    const r = await api(w, "conversations.history", { channel: c.id, oldest, limit: 30 }).catch(() => ({ messages: [] }));
+                    const label = await convLabel(w, c);
+                    for (const m of r.messages || []) {
+                        if (!m.user || m.user === w.userId || m.subtype || seen.has(c.id + "|" + m.ts)) continue;
+                        out.push({ ...(await shapeMessage(w, { ...m }, label)), kind: "group_dm", channel_id: c.id, link: await permalink(w, c.id, m.ts, m.thread_ts) });
+                    }
                 }
                 // @mentions in channels (found through search, which covers every channel you're in).
                 const after = new Date(Date.now() - mins * 60000 - 864e5).toISOString().slice(0, 10);
@@ -482,8 +507,8 @@ export function registerSlackTools(server) {
             const latest = thread_ts ? null : (r.messages || []).reduce((a, m) => (Number(m.ts) > Number(a || 0) ? m.ts : a), null);
             if (latest) {
                 await api(w, "conversations.mark", { channel: id, ts: latest }, true);
-                const c = wsCache(w);
-                if (c.unread) c.unread = null;
+                const u = unreadState.get(w.id);
+                if (u?.list) u.list = u.list.filter((x) => x.channel_id !== id);
                 marked = latest;
             }
         }

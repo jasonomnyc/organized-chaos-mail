@@ -14,6 +14,8 @@ const USER_SCOPES = [
     "channels:history", "channels:read", "groups:history", "groups:read",
     "im:history", "im:read", "im:write", "mpim:history", "mpim:read", "mpim:write",
     "users:read", "users:read.email", "search:read", "chat:write",
+    // Lets the app mark channels read in Slack (for channels you mute, and the board's Done / Mark read).
+    "channels:write", "groups:write",
 ];
 const STORE = "slack.json";
 const RANK = { read: 0, draft: 1, send: 2 };
@@ -248,6 +250,45 @@ async function plainText(w, text) {
     return s.replace(/<#[A-Z0-9]+\|([^>]+)>/g, "#$1").replace(/<(https?:[^|>]+)\|([^>]+)>/g, "$2 ($1)").replace(/<(https?:[^>]+)>/g, "$1")
         .replace(/<!(here|channel|everyone)>/g, "@$1").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 }
+/** The workspace's web address, e.g. https://fractioneer.slack.com/ (asked once). */
+async function teamUrl(w) {
+    const c = wsCache(w);
+    if (!c.url) {
+        c.url = api(w, "auth.test").then((r) => r.url || "").catch(() => "");
+    }
+    return c.url;
+}
+/** A link that opens the message in Slack (the app on a phone, or the browser). */
+async function permalink(w, channel, ts, threadTs) {
+    const base = await teamUrl(w);
+    if (!base || !channel || !ts) return undefined;
+    const p = `${base.replace(/\/?$/, "/")}archives/${channel}/p${String(ts).replace(".", "")}`;
+    return threadTs && threadTs !== ts ? `${p}?thread_ts=${threadTs}&cid=${channel}` : p;
+}
+/** Unread messages in each channel you're in (not DMs), newest first, from where you last read. */
+async function channelUnreads(w) {
+    const c = wsCache(w);
+    if (c.unread && Date.now() - c.unread.at < 60000) return c.unread.list;
+    const chans = (await conversations(w)).filter((x) => !x.is_im && !x.is_mpim);
+    const out = [];
+    for (let i = 0; i < chans.length; i += 6) {
+        const part = await Promise.all(chans.slice(i, i + 6).map(async (ch) => {
+            const info = await api(w, "conversations.info", { channel: ch.id }).catch(() => null);
+            const lastRead = info?.channel?.last_read;
+            if (!lastRead) return null;
+            const h = await api(w, "conversations.history", { channel: ch.id, oldest: lastRead, limit: 50 }).catch(() => null);
+            const msgs = (h?.messages || []).filter((m) => Number(m.ts) > Number(lastRead) && m.user !== w.userId && (!m.subtype || m.subtype === "bot_message" || m.subtype === "file_share" || m.subtype === "thread_broadcast"));
+            if (!msgs.length) return null;
+            const label = `#${ch.name}`;
+            const items = await Promise.all(msgs.slice(0, 10).map(async (m) => ({ ...(await shapeMessage(w, m, label)), kind: "channel", channel_id: ch.id, link: await permalink(w, ch.id, m.ts, m.thread_ts) })));
+            return { channel_id: ch.id, name: label, private: !!ch.is_private, unread: msgs.length, more: !!h?.has_more, last_read: lastRead, latest_ts: msgs[0].ts, items };
+        }));
+        out.push(...part.filter(Boolean));
+    }
+    out.sort((a, b) => Number(b.latest_ts) - Number(a.latest_ts));
+    c.unread = { at: Date.now(), list: out };
+    return out;
+}
 async function shapeMessage(w, m, channelLabel) {
     const who = m.user ? await userName(w, m.user) : { name: m.username || m.bot_profile?.name || "app", email: "" };
     return {
@@ -337,8 +378,9 @@ export function registerSlackTools(server) {
         inputSchema: {
             workspace: workspace.optional().describe('A nickname, or "all" (the default).'),
             since_minutes: z.number().int().min(1).max(7 * 24 * 60).optional().describe("How far back to look. Default 70 minutes."),
+            include_channels: z.boolean().optional().describe("Also return unread messages in every channel you're in, grouped by channel."),
         }, annotations: { readOnlyHint: true },
-    }, safe(async ({ workspace: nick, since_minutes }) => {
+    }, safe(async ({ workspace: nick, since_minutes, include_channels }) => {
         const s = await loadStore();
         const mins = since_minutes ?? 70;
         const oldest = sinceTs(mins);
@@ -353,7 +395,7 @@ export function registerSlackTools(server) {
                         const r = await api(w, "conversations.history", { channel: c.id, oldest, limit: 30 }).catch(() => ({ messages: [] }));
                         const label = await convLabel(w, c);
                         return Promise.all((r.messages || []).filter((m) => m.user && m.user !== w.userId && !m.subtype)
-                            .map((m) => shapeMessage(w, { ...m }, label).then((x) => ({ ...x, kind: c.is_im ? "dm" : "group_dm", channel_id: c.id }))));
+                            .map((m) => shapeMessage(w, { ...m }, label).then(async (x) => ({ ...x, kind: c.is_im ? "dm" : "group_dm", channel_id: c.id, link: await permalink(w, c.id, m.ts, m.thread_ts) }))));
                     }));
                     out.push(...batch.flat());
                 }
@@ -366,7 +408,8 @@ export function registerSlackTools(server) {
                     out.push({ ...(await shapeMessage(w, m, m.channel?.name ? `#${m.channel.name}` : "a channel")), kind: "mention", channel_id: m.channel?.id, link: m.permalink });
                 }
                 out.sort((a, b) => Number(b.ts) - Number(a.ts));
-                return { workspace: w.nickname, items: out };
+                const channels = include_channels ? await channelUnreads(w).catch((e) => ({ error: e.message })) : undefined;
+                return { workspace: w.nickname, items: out, ...(channels ? (Array.isArray(channels) ? { channels } : { channels_error: channels.error }) : {}) };
             }
             catch (err) {
                 return { workspace: w.nickname, error: err.message };
@@ -420,8 +463,9 @@ export function registerSlackTools(server) {
             workspace, channel: z.string(), thread_ts: z.string().optional(),
             limit: z.number().int().min(1).max(100).optional().describe("How many messages. Default 30."),
             since_minutes: z.number().int().min(1).optional(),
-        }, annotations: { readOnlyHint: true },
-    }, safe(async ({ workspace: nick, channel, thread_ts, limit, since_minutes }) => {
+            mark_read: z.boolean().optional().describe("Also mark the channel or DM read in Slack, up to its newest message."),
+        }, annotations: { readOnlyHint: false },
+    }, safe(async ({ workspace: nick, channel, thread_ts, limit, since_minutes, mark_read }) => {
         const s = await loadStore();
         const w = findWorkspace(s, nick);
         const id = await resolveChannel(w, channel);
@@ -432,7 +476,18 @@ export function registerSlackTools(server) {
         const label = ch ? await convLabel(w, ch) : id;
         const msgs = await Promise.all((r.messages || []).map((m) => shapeMessage(w, m, label)));
         msgs.sort((a, b) => Number(a.ts) - Number(b.ts));
-        return ok({ workspace: w.nickname, channel: label, channel_id: id, messages: msgs });
+        await Promise.all(msgs.map(async (m) => { m.link = await permalink(w, id, m.ts, m.thread_ts || thread_ts); }));
+        let marked;
+        if (mark_read) {
+            const latest = thread_ts ? null : (r.messages || []).reduce((a, m) => (Number(m.ts) > Number(a || 0) ? m.ts : a), null);
+            if (latest) {
+                await api(w, "conversations.mark", { channel: id, ts: latest }, true);
+                const c = wsCache(w);
+                if (c.unread) c.unread = null;
+                marked = latest;
+            }
+        }
+        return ok({ workspace: w.nickname, channel: label, channel_id: id, messages: msgs, ...(marked ? { marked_read: marked } : {}) });
     }));
 
     server.registerTool("slack_send", {

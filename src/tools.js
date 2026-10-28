@@ -109,7 +109,7 @@ export function registerTools(server) {
                 nickname: a.nickname,
                 provider: PROVIDER_LABEL[a.provider] ?? a.provider,
                 email: a.email,
-                ...(a.provider === "icloud" ? { aliases: a.aliases ?? [], send_as: a.sendAs ?? a.email, sender_name: a.senderName ?? null } : {}),
+                ...(a.provider === "icloud" ? { aliases: a.onlyAddress ? [] : (a.aliases ?? []), send_as: a.onlyAddress ? a.email : (a.sendAs ?? a.email), sender_name: a.senderName ?? null, only_this_address: !!a.onlyAddress } : {}),
                 description: a.description ?? null,
                 permission: effectivePermission(config, a),
             })),

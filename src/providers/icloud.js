@@ -113,7 +113,7 @@ export class IcloudProvider {
         this.connecting = (async () => {
             const c = new ImapFlow({
                 host: this.opts.imapHost ?? ICLOUD.imapHost, port: this.opts.imapPort ?? ICLOUD.imapPort,
-                secure: this.opts.imapSecure ?? true, auth: { user: this.account.email, pass: await this.secret() },
+                secure: this.opts.imapSecure ?? true, auth: { user: this.account.login || this.account.email, pass: await this.secret() },
                 logger: false, emitLogs: false, disableAutoIdle: true, socketTimeout: 90_000,
                 tls: this.opts.tls,
             });
@@ -122,7 +122,7 @@ export class IcloudProvider {
             try { await c.connect(); }
             catch (err) {
                 const auth = err?.authenticationFailed || /auth/i.test(String(err?.responseText ?? err?.message ?? ""));
-                throw new Error(auth ? `iCloud refused the sign-in for ${this.account.email}. Check the app-specific password (not your Apple ID password).` : `Couldn't reach iCloud mail: ${err?.message ?? err}`);
+                throw new Error(auth ? `iCloud refused the sign-in for ${this.account.login || this.account.email}. Use your iCloud Mail address (ending in @icloud.com, or the name before the @) and an app-specific password, not your Apple Account password.` : `Couldn't reach iCloud mail: ${err?.message ?? err}`);
             }
             this.client = c;
             return c;
@@ -194,6 +194,12 @@ export class IcloudProvider {
         try {
             const crit = { ...q.crit };
             if (opts.unreadOnly) crit.seen = false;
+            // Single-address inboxes: only mail to that address, and in Sent only mail from it.
+            if (this.account.onlyAddress) {
+                const a = this.account.email;
+                if (opts.sentBox) crit.from = a;
+                else crit.or = [{ to: a }, { cc: a }, { header: { "delivered-to": a } }, { header: { "x-original-to": a } }];
+            }
             if (!Object.keys(crit).length) crit.all = true;
             let uids = (await c.search(crit, { uid: true })) || [];
             uids.sort((a, b) => b - a);
@@ -228,8 +234,9 @@ export class IcloudProvider {
         else if (opts.query) boxes = [...new Set(["INBOX", await this.boxFor("Archive").catch(() => null), await this.boxFor("Sent").catch(() => null)].filter(Boolean))];
         else boxes = ["INBOX"];
         const all = [];
+        const sentPath = await this.boxFor("Sent").catch(() => null);
         for (const box of boxes) {
-            try { all.push(...(await this.run((c) => this.searchBox(c, box, opts, q)))); }
+            try { all.push(...(await this.run((c) => this.searchBox(c, box, { ...opts, sentBox: box === sentPath }, q)))); }
             catch (err) { if (boxes.length === 1) throw err; }
         }
         return all.sort((a, b) => Date.parse(b.date) - Date.parse(a.date)).slice(0, opts.maxResults ?? 20);
@@ -282,7 +289,9 @@ export class IcloudProvider {
         }
         const out = [];
         for (const id of ids) out.push(await this.getEmail(id).catch(() => null));
-        return out.filter(Boolean).sort((x, y) => Date.parse(x.date) - Date.parse(y.date));
+        const a = this.account.onlyAddress ? this.account.email.toLowerCase() : null;
+        const keep = (e) => !a || [e.from, ...(e.to ?? []), ...(e.cc ?? [])].some((x) => x?.email?.toLowerCase() === a);
+        return out.filter(Boolean).filter(keep).sort((x, y) => Date.parse(x.date) - Date.parse(y.date));
     }
     async listFolders() {
         this.boxes = null;
@@ -298,6 +307,11 @@ export class IcloudProvider {
     }
     /** Which of this inbox's addresses a message to `recips` should come from. */
     pickFrom(explicit, recips) {
+        if (this.account.onlyAddress) {
+            const e = explicit ? (String(explicit).match(/<([^>]+)>/)?.[1] ?? String(explicit).trim()) : "";
+            if (e && e.toLowerCase() !== this.account.email.toLowerCase()) throw new Error(`This inbox only sends from ${this.account.email}.`);
+            return this.account.email;
+        }
         const mine = [this.account.email, ...(this.account.aliases ?? [])].map((a) => a.toLowerCase());
         if (explicit) {
             const e = String(explicit).match(/<([^>]+)>/)?.[1] ?? String(explicit).trim();
@@ -318,7 +332,7 @@ export class IcloudProvider {
             references = [...refs, parsed.messageId].filter(Boolean).join(" ") || undefined;
             subject ??= /^re:/i.test(parsed.subject ?? "") ? parsed.subject : `Re: ${parsed.subject ?? ""}`;
             if (!to.length) {
-                const mine = new Set([this.account.email, ...(this.account.aliases ?? [])].map((a) => a.toLowerCase()));
+                const mine = new Set([this.account.email, this.account.login, ...(this.account.aliases ?? [])].filter(Boolean).map((a) => a.toLowerCase()));
                 const sender = parsedAddrs(parsed.replyTo).length ? parsedAddrs(parsed.replyTo) : parsedAddrs(parsed.from);
                 to = sender.map((a) => fmtAddr({ name: a.name, address: a.email }));
                 if (msg.replyAll) {
@@ -350,11 +364,12 @@ export class IcloudProvider {
         return { mail, raw, from };
     }
     smtp(pass) {
-        // iCloud signs in as the main address; an alias goes in From.
+        // iCloud signs in with the iCloud Mail address; an alias or custom-domain address goes in From.
+        const login = this.account.login || this.account.email;
         return nodemailer.createTransport({
             host: this.opts.smtpHost ?? ICLOUD.smtpHost, port: this.opts.smtpPort ?? ICLOUD.smtpPort,
             secure: this.opts.smtpSecure ?? false, requireTLS: this.opts.smtpRequireTLS ?? true,
-            tls: this.opts.tls, auth: { user: this.account.email, pass },
+            tls: this.opts.tls, auth: { user: login.includes("@") ? login : `${login}@icloud.com`, pass },
             connectionTimeout: 30_000, socketTimeout: 60_000,
         });
     }
@@ -445,8 +460,8 @@ export class IcloudProvider {
 }
 
 /** Checks an address and app-specific password by signing in to IMAP and SMTP. */
-export async function verifyIcloud(email, password, opts = {}) {
-    const p = new IcloudProvider({ id: "check", nickname: email, email }, { ...opts, password });
+export async function verifyIcloud(email, password, opts = {}, login) {
+    const p = new IcloudProvider({ id: "check", nickname: email, email, login }, { ...opts, password });
     try { await p.run((c) => c.list()); }
     finally { try { await p.client?.logout(); } catch { } }
     const t = p.smtp(password);

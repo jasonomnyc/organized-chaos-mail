@@ -98,20 +98,25 @@ const ADDR = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export function icloudForm(k, error, prev = {}) {
     const link = icloudLinks.get(k);
     if (!link || link.expires < Date.now()) return page("This link expired", "<p>Start adding the iCloud inbox again from Organized Chaos.</p>");
+    const only = prev.only === undefined ? true : prev.only === "on";
     return page(`Connect iCloud mail: ${link.nickname}`, `
-<p>Enter your iCloud address and an <b>app-specific password</b>, not your Apple Account password. Make one at
+<p>You need an <b>app-specific password</b>, not your Apple Account password. Make one at
 <a href="https://account.apple.com" target="_blank" rel="noopener">account.apple.com</a> › Sign-In and Security › App-Specific Passwords.</p>
 ${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
 <form method="post" action="/icloud/connect">
 <input type="hidden" name="k" value="${escapeHtml(k)}">
-<label for="em">iCloud address you sign in with</label>
-<input id="em" type="text" name="email" inputmode="email" autocomplete="username" value="${escapeHtml(prev.email ?? "")}" placeholder="you@icloud.com" required>
+<label for="em">Address to use in Organized Chaos</label>
+<input id="em" type="text" name="email" inputmode="email" value="${escapeHtml(prev.email ?? "")}" placeholder="you@yourdomain.com" required>
+<small>The address you send from and receive at. It can be an alias or a custom-domain address on your iCloud account.</small>
+<label for="lg">iCloud Mail address to sign in with</label>
+<input id="lg" type="text" name="login" inputmode="email" autocomplete="username" value="${escapeHtml(prev.login ?? "")}" placeholder="yourname@icloud.com">
+<small>Your iCloud Mail address (ending in @icloud.com), used only to sign in. iCloud's mail servers don't accept an Apple Account name that isn't an iCloud address. Leave blank if it's the same as above.</small>
 <label for="pw">App-specific password</label>
 <input id="pw" type="password" name="password" autocomplete="off" placeholder="xxxx-xxxx-xxxx-xxxx" required>
-<label for="al">Aliases to send from <small>(optional, comma separated)</small></label>
-<input id="al" type="text" name="aliases" value="${escapeHtml(prev.aliases ?? "")}" placeholder="hello@yourdomain.com, me@icloud.com">
-<label for="sa">Send new email from <small>(optional; blank = the address above)</small></label>
-<input id="sa" type="text" name="send_as" value="${escapeHtml(prev.send_as ?? "")}" placeholder="one of your aliases">
+<label style="display:flex;gap:8px;align-items:flex-start;font-weight:600"><input type="checkbox" name="only" ${only ? "checked" : ""} style="margin-top:4px">
+<span>Only show mail sent to this address, and always send from it<br><small style="font-weight:400">Mail to your other iCloud addresses stays out of Organized Chaos.</small></span></label>
+<label for="al">Other aliases to send from <small>(only when the box above is off; comma separated)</small></label>
+<input id="al" type="text" name="aliases" value="${escapeHtml(prev.aliases ?? "")}" placeholder="optional">
 <label for="nm">Name on sent mail <small>(optional)</small></label>
 <input id="nm" type="text" name="sender_name" value="${escapeHtml(prev.sender_name ?? "")}" placeholder="Jay">
 <button type="submit">Connect</button>
@@ -122,20 +127,22 @@ export async function finishIcloudSignIn(k, form) {
     const link = icloudLinks.get(k);
     if (!link || link.expires < Date.now()) throw new Error("This link expired. Start again from Organized Chaos.");
     const email = cleanAddr(form.email);
+    let login = String(form.login ?? "").trim().toLowerCase();
     const password = String(form.password ?? "").trim();
+    const onlyAddress = form.only === "on";
     if (!ADDR.test(email)) throw new Error("That doesn't look like an email address.");
     if (!password) throw new Error("Enter the app-specific password.");
-    const aliases = [...new Set(String(form.aliases ?? "").split(/[,\s;]+/).map(cleanAddr).filter((a) => a && a !== email))];
+    if (login && !login.includes("@") && !/^[a-z0-9._+-]+$/.test(login)) throw new Error("Enter your iCloud Mail address, like yourname@icloud.com.");
+    if (login === email) login = "";
+    const aliases = onlyAddress ? [] : [...new Set(String(form.aliases ?? "").split(/[,\s;]+/).map(cleanAddr).filter((a) => a && a !== email))];
     for (const a of aliases) if (!ADDR.test(a)) throw new Error(`"${a}" doesn't look like an email address.`);
-    const sendAs = cleanAddr(form.send_as);
-    if (sendAs && sendAs !== email && !aliases.includes(sendAs)) aliases.push(sendAs);
-    await verifyIcloud(email, password);
+    await verifyIcloud(email, password, {}, login || undefined);
     const config = await loadConfig();
     const existing = config.accounts.find((a) => a.provider === "icloud" && a.email.toLowerCase() === email);
     const id = existing?.id ?? randomUUID();
     await writeToken(id, { password });
     const saved = await saveAccount({ id, provider: "icloud", nickname: link.nickname, description: link.description, email, aliases,
-        sendAs: sendAs && sendAs !== email ? sendAs : undefined, senderName: String(form.sender_name ?? "").trim() || undefined });
+        login: login || undefined, onlyAddress: onlyAddress || undefined, senderName: String(form.sender_name ?? "").trim() || undefined });
     icloudLinks.delete(k);
     pending.delete(link.key);
     return saved;
@@ -160,6 +167,8 @@ async function saveAccount(input) {
                 existing.aliases = input.aliases;
                 existing.sendAs = input.sendAs;
                 existing.senderName = input.senderName;
+                existing.login = input.login;
+                existing.onlyAddress = input.onlyAddress;
             }
             saved = existing;
         }

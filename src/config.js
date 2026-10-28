@@ -28,6 +28,10 @@ export const AccountSchema = z.object({
     sendAs: z.string().optional(),
     /** iCloud only: the name shown on mail it sends. */
     senderName: z.string().optional(),
+    /** iCloud only: the iCloud Mail address (or its name part) used to sign in, when it differs from `email`. */
+    login: z.string().optional(),
+    /** iCloud only: show only mail sent to `email`, and always send from it. */
+    onlyAddress: z.boolean().optional(),
 });
 export const ConfigSchema = z.object({
     permission: PermissionLevel.default("draft"),

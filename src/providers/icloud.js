@@ -194,12 +194,6 @@ export class IcloudProvider {
         try {
             const crit = { ...q.crit };
             if (opts.unreadOnly) crit.seen = false;
-            // Single-address inboxes: only mail to that address, and in Sent only mail from it.
-            if (this.account.onlyAddress) {
-                const a = this.account.email;
-                if (opts.sentBox) crit.from = a;
-                else crit.or = [{ to: a }, { cc: a }, { header: { "delivered-to": a } }, { header: { "x-original-to": a } }];
-            }
             if (!Object.keys(crit).length) crit.all = true;
             let uids = (await c.search(crit, { uid: true })) || [];
             uids.sort((a, b) => b - a);
@@ -208,11 +202,31 @@ export class IcloudProvider {
             // Exact dates for the candidates, newest first.
             const dated = [];
             for await (const m of c.fetch(uids, { uid: true, internalDate: true }, { uid: true })) dated.push({ uid: m.uid, t: +m.internalDate });
-            const pick = dated
+            const ordered = dated
                 .filter((d) => (q.afterMs == null || d.t >= q.afterMs) && (q.beforeMs == null || d.t < q.beforeMs))
                 .sort((a, b) => b.t - a.t)
-                .slice(0, opts.maxResults ?? 20)
                 .map((d) => d.uid);
+            const want = opts.maxResults ?? 20;
+            let pick;
+            if (this.account.onlyAddress) {
+                // Single-address inboxes: keep only mail that has this address in From, To, Cc, Bcc, Delivered-To or
+                // X-Original-To. Checked here, header by header, because iCloud's own search doesn't match
+                // custom-domain addresses reliably. Newest first, in batches, until there are enough.
+                pick = [];
+                const a = this.account.email.toLowerCase();
+                const has = (list) => (list ?? []).some((x) => String(x?.address ?? "").toLowerCase() === a);
+                for (let i = 0; i < ordered.length && pick.length < want; i += 150) {
+                    const batch = ordered.slice(i, i + 150);
+                    const ok = new Set();
+                    for await (const m of c.fetch(batch, { uid: true, envelope: true, headers: ["delivered-to", "x-original-to", "x-apple-original-recipient", "envelope-to"] }, { uid: true })) {
+                        const e = m.envelope ?? {};
+                        const extra = (m.headers ? m.headers.toString() : "").toLowerCase();
+                        if (has(e.from) || has(e.sender) || has(e.to) || has(e.cc) || has(e.bcc) || has(e.replyTo) || extra.includes(a)) ok.add(m.uid);
+                    }
+                    for (const u of batch) if (ok.has(u) && pick.length < want) pick.push(u);
+                }
+            }
+            else pick = ordered.slice(0, want);
             if (!pick.length) return [];
             const out = [];
             for await (const m of c.fetch(pick, {

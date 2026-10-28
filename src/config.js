@@ -8,7 +8,7 @@ import { z } from "zod";
  */
 export const PermissionLevel = z.enum(["read", "draft", "send"]);
 const LEVEL_RANK = { read: 0, draft: 1, send: 2 };
-export const Provider = z.enum(["gmail", "microsoft"]);
+export const Provider = z.enum(["gmail", "microsoft", "icloud"]);
 export const AccountSchema = z.object({
     /** Stable internal id; names the account's token file. */
     id: z.string(),
@@ -23,6 +23,11 @@ export const AccountSchema = z.object({
     permission: PermissionLevel.optional(),
     /** Microsoft only: which signed-in account in the token cache this inbox uses. */
     homeAccountId: z.string().optional(),
+    /** iCloud only: other addresses this inbox can send from, and the one new mail uses by default. */
+    aliases: z.array(z.string()).optional(),
+    sendAs: z.string().optional(),
+    /** iCloud only: the name shown on mail it sends. */
+    senderName: z.string().optional(),
 });
 export const ConfigSchema = z.object({
     permission: PermissionLevel.default("draft"),

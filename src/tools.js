@@ -30,6 +30,14 @@ async function open(nickname, needed, action) {
     requirePermission(config, account, needed, action);
     return { config, account, mail: await providerFor(config, account) };
 }
+const PROVIDER_LABEL = { gmail: "Gmail", microsoft: "Microsoft", icloud: "iCloud" };
+/** Sending from another address only works where the inbox has aliases (iCloud). */
+function checkFrom(account, from) {
+    if (!from) return;
+    const e = (String(from).match(/<([^>]+)>/)?.[1] ?? String(from)).trim().toLowerCase();
+    if (e === account.email.toLowerCase()) return;
+    if (account.provider !== "icloud") throw new Error(`Sending from another address works for iCloud inboxes only. "${account.nickname}" sends from ${account.email}.`);
+}
 export const inbox = z
     .string()
     .describe('The inbox nickname, as shown by list_accounts (for example "Work").');
@@ -61,6 +69,10 @@ const composeFields = {
         .string()
         .optional()
         .describe("Copy every attachment from this email (in the same inbox) onto this message, for example when forwarding it."),
+    from: z
+        .string()
+        .optional()
+        .describe("iCloud inboxes: send from this alias (one of the inbox's addresses in list_accounts). Replies to mail sent to an alias use that alias automatically."),
 };
 function toOutgoing(args) {
     return {
@@ -77,6 +89,7 @@ function toOutgoing(args) {
             data: Buffer.from(a.content_base64, "base64"),
         })),
         includeAttachmentsFrom: args.include_attachments_from_email_id,
+        from: args.from,
     };
 }
 export function registerTools(server) {
@@ -94,8 +107,9 @@ export function registerTools(server) {
             default_permission: config.permission,
             inboxes: config.accounts.map((a) => ({
                 nickname: a.nickname,
-                provider: a.provider === "gmail" ? "Gmail" : "Microsoft",
+                provider: PROVIDER_LABEL[a.provider] ?? a.provider,
                 email: a.email,
+                ...(a.provider === "icloud" ? { aliases: a.aliases ?? [], send_as: a.sendAs ?? a.email, sender_name: a.senderName ?? null } : {}),
                 description: a.description ?? null,
                 permission: effectivePermission(config, a),
             })),
@@ -109,11 +123,12 @@ export function registerTools(server) {
     }));
     server.registerTool("add_account", {
         title: "Connect an inbox",
-        description: "Connect a Gmail or Microsoft (Microsoft 365 or Outlook.com) inbox. Returns a sign-in link " +
-            "to give the person. The inbox appears in " +
+        description: "Connect a Gmail, Microsoft (Microsoft 365 or Outlook.com) or iCloud Mail inbox. Returns a sign-in link " +
+            "to give the person. iCloud uses an app-specific password and can send from aliases; the person types " +
+            "the password on the linked page, never in chat. The inbox appears in " +
             "list_accounts once they finish signing in.",
         inputSchema: {
-            provider: z.enum(["gmail", "microsoft"]),
+            provider: z.enum(["gmail", "microsoft", "icloud"]),
             nickname: z
                 .string()
                 .describe('A short name the person chooses, like "Work" or "Personal".'),
@@ -124,6 +139,9 @@ export function registerTools(server) {
         },
     }, safe(async ({ provider, nickname, description }) => {
         const signIn = await beginAddAccount(provider, nickname, description);
+        if (provider === "icloud") return ok(`To finish connecting "${signIn.nickname}", open this link and enter the iCloud address, an app-specific password ` +
+            `(made at account.apple.com › Sign-In and Security › App-Specific Passwords) and any aliases to send from. It expires in 30 minutes:\n${signIn.url}\n` +
+            `Once they've finished, call list_accounts to confirm "${signIn.nickname}" is connected.`);
         return ok(`To finish connecting "${signIn.nickname}", open this link and sign in to ${provider === "gmail" ? "Google" : "Microsoft"} ` +
             `(it works from a phone or computer, and expires in 15 minutes):\n${signIn.url}\n` +
             `Once they've finished, call list_accounts to confirm "${signIn.nickname}" is connected.`);
@@ -137,19 +155,26 @@ export function registerTools(server) {
             new_nickname: z.string().optional(),
             description: z.string().optional().describe("New description; empty text clears it."),
             permission: z.enum(["read", "draft", "send", "default"]).optional(),
+            aliases: z.array(z.string()).optional().describe("iCloud only: every alias this inbox may send from (replaces the list)."),
+            send_as: z.string().optional().describe("iCloud only: the address new emails come from by default."),
+            sender_name: z.string().optional().describe("iCloud only: the name shown on sent mail; empty clears it."),
         },
         annotations: { idempotentHint: true },
-    }, safe(async ({ inbox, new_nickname, description, permission }) => {
+    }, safe(async ({ inbox, new_nickname, description, permission, aliases, send_as, sender_name }) => {
         const account = await editAccount(inbox, {
             newNickname: new_nickname,
             description,
             permission,
+            aliases,
+            sendAs: send_as,
+            senderName: sender_name,
         });
         const config = await loadConfig();
         return ok({
             nickname: account.nickname,
             description: account.description ?? null,
             permission: effectivePermission(config, account),
+            ...(account.provider === "icloud" ? { aliases: account.aliases ?? [], send_as: account.sendAs ?? account.email, sender_name: account.senderName ?? null } : {}),
         });
     }));
     server.registerTool("set_default_permission", {
@@ -278,6 +303,7 @@ export function registerTools(server) {
         inputSchema: composeFields,
     }, safe(async (args) => {
         const { account, mail } = await open(args.inbox, "draft", "write drafts");
+        checkFrom(account, args.from);
         const draft = await mail.createDraft(toOutgoing(args));
         return ok({ inbox: account.nickname, draft });
     }));
@@ -320,8 +346,9 @@ export function registerTools(server) {
         annotations: { destructiveHint: true, openWorldHint: true },
     }, safe(async (args) => {
         const { account, mail } = await open(args.inbox, "send", "send email");
+        checkFrom(account, args.from);
         await mail.send(toOutgoing(args));
-        return ok(`Sent from "${account.nickname}" (${account.email}).`);
+        return ok(`Sent from "${account.nickname}" (${args.from || account.email}).`);
     }));
     server.registerTool("send_draft", {
         title: "Send a draft",

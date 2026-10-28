@@ -18,8 +18,10 @@ import { SUCCESS_PAGE, errorPage, escapeHtml, page } from "./auth/pages.js";
 import { importDesktop } from "./importDesktop.js";
 import { loadConfig } from "./config.js";
 import { importPage } from "./importPage.js";
+import { registerLogoTools } from "./logo.js";
+import { icloudForm, finishIcloudSignIn } from "./accounts.js";
 
-const INSTRUCTIONS = "This server connects several separate email inboxes (Gmail and Microsoft). Each inbox has " +
+const INSTRUCTIONS = "This server connects several separate email inboxes (Gmail, Microsoft and iCloud). Each inbox has " +
     "a nickname; call list_accounts to see them and their descriptions, then pass the nickname " +
     "to every other tool. Each inbox has a permission level (read, draft or send) that the " +
     "person controls; don't change it unless they ask. Each inbox's calendar uses the same " +
@@ -37,6 +39,7 @@ function buildMcpServer() {
     registerInviteTools(server);
     registerUnsubscribeTools(server);
     registerSlackTools(server);
+    registerLogoTools(server);
     return server;
 }
 
@@ -117,6 +120,23 @@ app.get("/oauth/slack/callback", async (req, res) => {
     }
     catch (err) {
         res.status(400).type("html").send(errorPage(err?.message ?? String(err)));
+    }
+});
+
+// iCloud: the person types the app-specific password here, in their own browser, never in chat.
+app.get("/icloud/connect", (req, res) => res.type("html").send(icloudForm(String(req.query.k ?? ""))));
+let icloudTries = 0;
+setInterval(() => (icloudTries = 0), 15 * 60 * 1000).unref();
+app.post("/icloud/connect", express.urlencoded({ extended: false, limit: "10kb" }), async (req, res) => {
+    if (icloudTries >= 20) return res.status(429).type("html").send(errorPage("Too many tries. Wait 15 minutes."));
+    icloudTries += 1;
+    const k = String(req.body.k ?? "");
+    try {
+        const account = await finishIcloudSignIn(k, req.body);
+        res.type("html").send(page("iCloud mail is connected", `<p><b>${escapeHtml(account.nickname)}</b> (${escapeHtml(account.email)}) is connected${account.aliases?.length ? `, with ${account.aliases.length} alias${account.aliases.length === 1 ? "" : "es"} to send from` : ""}. You can close this tab and go back to Organized Chaos.</p>`));
+    }
+    catch (err) {
+        res.status(400).type("html").send(icloudForm(k, err?.message ?? String(err), req.body));
     }
 });
 

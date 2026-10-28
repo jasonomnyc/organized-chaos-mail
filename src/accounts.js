@@ -4,6 +4,10 @@ import { forgetGoogleClient, startGoogleSignIn } from "./auth/google.js";
 import { removeMicrosoftAccount, startMicrosoftSignIn } from "./auth/microsoft.js";
 import { deleteToken, writeToken } from "./auth/tokenStore.js";
 import { forgetProvider } from "./providers/index.js";
+import { randomBytes } from "node:crypto";
+import { baseUrl } from "./auth/appKeys.js";
+import { escapeHtml, page } from "./auth/pages.js";
+import { verifyIcloud } from "./providers/icloud.js";
 /** Sign-ins started by add_account that haven't finished, or failed recently. */
 const pending = new Map();
 export function pendingSignIns() {
@@ -38,6 +42,13 @@ export async function beginAddAccount(provider, nicknameIn, description) {
     };
     pending.set(key, entry);
     try {
+        if (provider === "icloud") {
+            const k = randomBytes(24).toString("base64url");
+            entry.url = `${baseUrl()}/icloud/connect?k=${k}`;
+            icloudLinks.set(k, { key, nickname, description, expires: Date.now() + 30 * 60_000 });
+            setTimeout(() => { if (icloudLinks.has(k)) { icloudLinks.delete(k); if (pending.get(key) === entry) pending.delete(key); } }, 30 * 60_000).unref();
+            return entry;
+        }
         if (provider === "gmail") {
             const signIn = await startGoogleSignIn(config);
             entry.url = signIn.url;
@@ -80,6 +91,55 @@ export async function beginAddAccount(provider, nicknameIn, description) {
     }
     return entry;
 }
+/** iCloud sign-in links waiting for the person to enter their app-specific password. */
+const icloudLinks = new Map();
+function cleanAddr(s) { return String(s ?? "").trim().replace(/^.*<([^>]+)>.*$/, "$1").toLowerCase(); }
+const ADDR = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export function icloudForm(k, error, prev = {}) {
+    const link = icloudLinks.get(k);
+    if (!link || link.expires < Date.now()) return page("This link expired", "<p>Start adding the iCloud inbox again from Organized Chaos.</p>");
+    return page(`Connect iCloud mail: ${link.nickname}`, `
+<p>Enter your iCloud address and an <b>app-specific password</b>, not your Apple Account password. Make one at
+<a href="https://account.apple.com" target="_blank" rel="noopener">account.apple.com</a> › Sign-In and Security › App-Specific Passwords.</p>
+${error ? `<p class="err">${escapeHtml(error)}</p>` : ""}
+<form method="post" action="/icloud/connect">
+<input type="hidden" name="k" value="${escapeHtml(k)}">
+<label for="em">iCloud address you sign in with</label>
+<input id="em" type="text" name="email" inputmode="email" autocomplete="username" value="${escapeHtml(prev.email ?? "")}" placeholder="you@icloud.com" required>
+<label for="pw">App-specific password</label>
+<input id="pw" type="password" name="password" autocomplete="off" placeholder="xxxx-xxxx-xxxx-xxxx" required>
+<label for="al">Aliases to send from <small>(optional, comma separated)</small></label>
+<input id="al" type="text" name="aliases" value="${escapeHtml(prev.aliases ?? "")}" placeholder="hello@yourdomain.com, me@icloud.com">
+<label for="sa">Send new email from <small>(optional; blank = the address above)</small></label>
+<input id="sa" type="text" name="send_as" value="${escapeHtml(prev.send_as ?? "")}" placeholder="one of your aliases">
+<label for="nm">Name on sent mail <small>(optional)</small></label>
+<input id="nm" type="text" name="sender_name" value="${escapeHtml(prev.sender_name ?? "")}" placeholder="Jay">
+<button type="submit">Connect</button>
+<p><small>The password is checked with iCloud, then kept encrypted on your mail server. Revoke it any time from your Apple Account.</small></p>
+</form>`);
+}
+export async function finishIcloudSignIn(k, form) {
+    const link = icloudLinks.get(k);
+    if (!link || link.expires < Date.now()) throw new Error("This link expired. Start again from Organized Chaos.");
+    const email = cleanAddr(form.email);
+    const password = String(form.password ?? "").trim();
+    if (!ADDR.test(email)) throw new Error("That doesn't look like an email address.");
+    if (!password) throw new Error("Enter the app-specific password.");
+    const aliases = [...new Set(String(form.aliases ?? "").split(/[,\s;]+/).map(cleanAddr).filter((a) => a && a !== email))];
+    for (const a of aliases) if (!ADDR.test(a)) throw new Error(`"${a}" doesn't look like an email address.`);
+    const sendAs = cleanAddr(form.send_as);
+    if (sendAs && sendAs !== email && !aliases.includes(sendAs)) aliases.push(sendAs);
+    await verifyIcloud(email, password);
+    const config = await loadConfig();
+    const existing = config.accounts.find((a) => a.provider === "icloud" && a.email.toLowerCase() === email);
+    const id = existing?.id ?? randomUUID();
+    await writeToken(id, { password });
+    const saved = await saveAccount({ id, provider: "icloud", nickname: link.nickname, description: link.description, email, aliases,
+        sendAs: sendAs && sendAs !== email ? sendAs : undefined, senderName: String(form.sender_name ?? "").trim() || undefined });
+    icloudLinks.delete(k);
+    pending.delete(link.key);
+    return saved;
+}
 /** Adds the account, or refreshes it if this address is already connected. */
 async function saveAccount(input) {
     let saved;
@@ -96,6 +156,11 @@ async function saveAccount(input) {
                 existing.description = input.description;
             if (input.homeAccountId)
                 existing.homeAccountId = input.homeAccountId;
+            if (input.provider === "icloud") {
+                existing.aliases = input.aliases;
+                existing.sendAs = input.sendAs;
+                existing.senderName = input.senderName;
+            }
             saved = existing;
         }
         else {
@@ -132,8 +197,24 @@ export async function editAccount(nickname, changes) {
             delete account.permission;
         else if (changes.permission)
             account.permission = changes.permission;
+        if (changes.aliases !== undefined || changes.sendAs !== undefined || changes.senderName !== undefined) {
+            if (account.provider !== "icloud") throw new Error("Aliases are for iCloud inboxes only.");
+            if (changes.aliases !== undefined) {
+                const list = [...new Set(changes.aliases.map(cleanAddr).filter((a) => a && a !== account.email.toLowerCase()))];
+                for (const a of list) if (!ADDR.test(a)) throw new Error(`"${a}" doesn't look like an email address.`);
+                account.aliases = list;
+            }
+            if (changes.sendAs !== undefined) {
+                const s = cleanAddr(changes.sendAs);
+                if (!s || s === account.email.toLowerCase()) delete account.sendAs;
+                else if (!(account.aliases ?? []).includes(s)) throw new Error(`${s} isn't one of this inbox's aliases. Add it to aliases first.`);
+                else account.sendAs = s;
+            }
+            if (changes.senderName !== undefined) account.senderName = changes.senderName.trim() || undefined;
+        }
         result = account;
     });
+    forgetProvider(result.id);
     return result;
 }
 export async function removeAccount(nickname) {
@@ -143,7 +224,10 @@ export async function removeAccount(nickname) {
         c.accounts = c.accounts.filter((a) => a !== removed);
     });
     forgetProvider(removed.id);
-    if (removed.provider === "gmail") {
+    if (removed.provider === "icloud") {
+        await deleteToken(removed.id);
+    }
+    else if (removed.provider === "gmail") {
         forgetGoogleClient(removed.id);
         await deleteToken(removed.id);
     }

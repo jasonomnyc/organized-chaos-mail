@@ -74,7 +74,7 @@ export function registerCalendarTools(server) {
     }, safe(async ({ inbox, start, end, query, calendar, time_zone, max_results }) => {
         const tz = checkZone(time_zone);
         const config = await loadConfig();
-        const targets = inbox.trim().toLowerCase() === "all" ? config.accounts : [findAccount(config, inbox)];
+        const targets = inbox.trim().toLowerCase() === "all" ? config.accounts.filter((a) => a.provider !== "icloud") : [findAccount(config, inbox)];
         if (!targets.length)
             throw new Error("No inboxes are connected yet. Use add_account first.");
         const s = start ? parseWhen(start, tz) : { allDay: false, ms: Date.now() };

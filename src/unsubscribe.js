@@ -14,6 +14,7 @@ import { inbox, ok, safe } from "./tools.js";
 
 /** The List-Unsubscribe headers of one email. */
 async function listHeaders(account, mail, emailId) {
+    if (account.provider === "icloud") return mail.headers(emailId);
     if (account.provider === "gmail") {
         const msg = await mail.call(`/messages/${encodeURIComponent(emailId)}`, {
             params: { format: "metadata", metadataHeaders: ["List-Unsubscribe", "List-Unsubscribe-Post", "From", "Subject"] },

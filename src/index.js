@@ -20,6 +20,7 @@ import { loadConfig } from "./config.js";
 import { importPage } from "./importPage.js";
 import { registerLogoTools } from "./logo.js";
 import { icloudForm, finishIcloudSignIn } from "./accounts.js";
+import { registerNotifyTools, startNotifier, ntfyForm, finishNtfyForm, ntfyAction } from "./notify.js";
 
 const INSTRUCTIONS = "This server connects several separate email inboxes (Gmail, Microsoft and iCloud). Each inbox has " +
     "a nickname; call list_accounts to see them and their descriptions, then pass the nickname " +
@@ -40,6 +41,7 @@ function buildMcpServer() {
     registerUnsubscribeTools(server);
     registerSlackTools(server);
     registerLogoTools(server);
+    registerNotifyTools(server);
     return server;
 }
 
@@ -123,6 +125,28 @@ app.get("/oauth/slack/callback", async (req, res) => {
     }
 });
 
+// ntfy: the person types the access token here, in their own browser, never in chat.
+app.get("/ntfy/connect", (req, res) => res.type("html").send(ntfyForm(String(req.query.k ?? ""))));
+let ntfyTries = 0;
+setInterval(() => (ntfyTries = 0), 15 * 60 * 1000).unref();
+app.post("/ntfy/connect", express.urlencoded({ extended: false, limit: "10kb" }), async (req, res) => {
+    if (ntfyTries >= 20) return res.status(429).type("html").send(errorPage("Too many tries. Wait 15 minutes."));
+    ntfyTries += 1;
+    const k = String(req.body.k ?? "");
+    try {
+        await finishNtfyForm(k, req.body);
+        res.type("html").send(page("ntfy is connected", "<p>A test notification is on its way to your phone. You can close this tab and go back to Organized Chaos.</p>"));
+    }
+    catch (err) {
+        res.status(400).type("html").send(ntfyForm(k, err?.message ?? String(err)));
+    }
+});
+// Done / Snooze buttons on a reminder notification (signed links).
+app.all("/ntfy/act", async (req, res) => {
+    try { res.type("text").send(await ntfyAction(req.query)); }
+    catch (err) { res.status(400).type("text").send(String(err?.message ?? err)); }
+});
+
 // iCloud: the person types the app-specific password here, in their own browser, never in chat.
 app.get("/icloud/connect", (req, res) => res.type("html").send(icloudForm(String(req.query.k ?? ""))));
 let icloudTries = 0;
@@ -188,3 +212,4 @@ const port = Number(process.env.PORT || 8080);
 const problems = checkSettings();
 if (problems.length) console.warn(`Missing settings: ${problems.join(", ")}. The connector stays locked until they're set.`);
 app.listen(port, () => console.log(`Organized Chaos Mail listening on ${port} — ${mcpUrl.href}`));
+startNotifier();

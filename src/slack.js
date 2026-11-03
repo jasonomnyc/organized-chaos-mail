@@ -16,6 +16,8 @@ const USER_SCOPES = [
     "users:read", "users:read.email", "search:read", "chat:write",
     // Lets the app mark channels read in Slack (for channels you mute, and the board's Done / Mark read).
     "channels:write", "groups:write",
+    // Lets the app open the files and pictures people share (slack_file).
+    "files:read",
 ];
 const STORE = "slack.json";
 const RANK = { read: 0, draft: 1, send: 2 };
@@ -351,6 +353,11 @@ async function shapeMessage(w, m, channelLabel) {
         ts: m.ts, when: new Date(Number(m.ts) * 1000).toISOString(), from: who.name, from_email: who.email || undefined,
         text: (await plainText(w, m.text)).slice(0, 4000), thread_ts: m.thread_ts && m.thread_ts !== m.ts ? m.thread_ts : undefined,
         replies: m.reply_count || undefined, channel: channelLabel, files: (m.files || []).map((f) => f.name).filter(Boolean).slice(0, 10),
+        // The same files with what's needed to open them (slack_file) and show a preview.
+        file_list: (m.files || []).filter((f) => f && f.id && f.mode !== "tombstone").slice(0, 10).map((f) => ({
+            id: f.id, name: f.name || f.title || "file", mimetype: f.mimetype || undefined, filetype: f.filetype || undefined,
+            size: f.size || undefined, image: /^image\//.test(f.mimetype || "") || undefined, link: f.permalink || undefined,
+        })),
     };
 }
 const sinceTs = (minutes) => String(Math.floor((Date.now() - minutes * 60000) / 1000));
@@ -565,6 +572,32 @@ export function registerSlackTools(server) {
             }
         }
         return ok({ workspace: w.nickname, channel: label, channel_id: id, messages: msgs, ...(marked ? { marked_read: marked } : {}) });
+    }));
+
+    server.registerTool("slack_file", {
+        title: "Open a file shared in Slack",
+        description: "Download a file or picture someone shared in Slack, by its id from file_list on a message. " +
+            'With size "preview", pictures come back as a small preview instead of the full file. Returns the file base64-encoded (files over 20 MB are not returned; open them in Slack).',
+        inputSchema: { workspace, file_id: z.string(), size: z.enum(["preview", "full"]).optional() },
+        annotations: { readOnlyHint: true },
+    }, safe(async ({ workspace: nick, file_id, size }) => {
+        const s = await loadStore();
+        const w = findWorkspace(s, nick);
+        const info = (await api(w, "files.info", { file: file_id })).file || {};
+        const thumb = size === "preview" ? (info.thumb_480 || info.thumb_360 || info.thumb_720 || info.thumb_pdf) : null;
+        const url = thumb || info.url_private_download || info.url_private;
+        if (!url) throw new Error("Slack didn't give a way to download that file. Open it in Slack.");
+        if (!thumb && (info.size || 0) > 20 * 1024 * 1024) throw new Error(`"${info.name}" is ${((info.size || 0) / 1048576).toFixed(1)} MB, too large to open here. Open it in Slack.`);
+        const u = new URL(url);
+        if (!/(^|\.)slack(-edge|-files)?\.com$|(^|\.)slack-files\.com$/.test(u.hostname)) throw new Error("That file isn't stored on Slack.");
+        const res = await fetch(u, { headers: { Authorization: `Bearer ${await tokenFor(w)}` }, signal: AbortSignal.timeout(60000) });
+        if (!res.ok) throw new Error(`Slack wouldn't send the file (HTTP ${res.status}). Reconnect "${w.nickname}" so the app can open files.`);
+        const type = (res.headers.get("content-type") || "").split(";")[0];
+        if (/text\/html/.test(type)) throw new Error(`Slack asked to sign in again for files. Reconnect "${w.nickname}" so the app can open files.`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > 20 * 1024 * 1024) throw new Error("That file is too large to open here. Open it in Slack.");
+        return ok({ workspace: w.nickname, file_id, name: info.name || "file", mime_type: thumb ? (type || "image/jpeg") : (info.mimetype || type || "application/octet-stream"),
+            preview: !!thumb, size: buf.length, link: info.permalink || undefined, content_base64: buf.toString("base64") });
     }));
 
     server.registerTool("slack_send", {

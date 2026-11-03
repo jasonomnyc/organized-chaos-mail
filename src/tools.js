@@ -24,6 +24,9 @@ export function safe(fn) {
         }
     };
 }
+export async function openInbox(nickname, needed, action) {
+    return open(nickname, needed, action);
+}
 async function open(nickname, needed, action) {
     const config = await loadConfig();
     const account = findAccount(config, nickname);

@@ -153,7 +153,26 @@ function quiet(ms) {
     const nextDay = qs > qe && p.h >= qs;
     return fromLocal(p.y, p.mo, p.d + (nextDay ? 1 : 0), qe, 0, 0, s.tz);
 }
-const FOLLOW = { hourly: 3600e3, daily: 864e5 };
+const FOLLOW = { hourly: 3600e3, daily: 864e5, weekly: 7 * 864e5 };
+/** The next follow-up after `last`: every hour (quiet hours skipped), every day at a set time, or every week on a set day and time. */
+function nextFollow(r, last) {
+    const s = settings();
+    if (r.follow === "hourly") return quiet(last + 3600e3);
+    const m = /^(\d{1,2}):(\d{2})$/.exec(r.followTime || "");
+    const dueP = parts(+new Date(r.due), s.tz);
+    const hh = m ? +m[1] : dueP.h, mi = m ? +m[2] : dueP.mi;
+    if (r.follow === "daily" && !m) return quiet(last + 864e5);
+    if (r.follow !== "daily" && r.follow !== "weekly") return null;
+    const p = parts(last, s.tz);
+    const dow = r.follow === "weekly" ? (Number.isInteger(r.followDow) ? r.followDow : dueP.wd) : null;
+    for (let add = 0; add <= 8; add++) {
+        const t = fromLocal(p.y, p.mo, p.d + add, hh, mi, 0, s.tz);
+        if (t <= last + 60e3) continue;
+        if (dow != null && parts(t, s.tz).wd !== dow) continue;
+        return t;
+    }
+    return last + FOLLOW[r.follow];
+}
 /** When this reminder should next go off, or null. */
 function nextAlert(r) {
     if (r.done || !r.due) return null;
@@ -161,8 +180,7 @@ function nextAlert(r) {
     const last = r.lastNote ? +new Date(r.lastNote) : 0;
     if (r.snooze && r.snooze > last) return r.snooze;
     if (last < due) return due;
-    const iv = FOLLOW[r.follow];
-    return iv ? quiet(last + iv) : null;
+    return FOLLOW[r.follow] ? nextFollow(r, last) : null;
 }
 
 /* ---------- the scheduler ---------- */
@@ -188,7 +206,7 @@ async function tick() {
                         // except during quiet hours, when it waits for the morning.
                         const nag = !!FOLLOW[r.follow] && !!r.lastNote;
                         const late = now - at > 2 * 60e3;
-                        if (late && nag && quiet(now) !== now) { r.snooze = quiet(now); r.queuedFor = null; changed = true; continue; }
+                        if (late && nag && !(r.followTime && r.follow !== "hourly") && quiet(now) !== now) { r.snooze = quiet(now); r.queuedFor = null; changed = true; continue; }
                         const send = now - at < LATE || nag;
                         if (r.queuedFor !== at && send && r.push !== false) await ntfy(reminderMessage(r, null));
                         if (send) await sendMailAlerts(r).catch((err) => note(`reminder mail for ${r.title}: ${err.message}`));
@@ -328,7 +346,9 @@ const ReminderInput = z.object({
     priority: z.enum(["urgent", "high", "normal", "low"]).optional(),
     due: z.string().describe("ISO time the task is due."),
     last_note: z.string().nullable().optional().describe("When the last alert went off, if known (ISO)."),
-    follow: z.enum(["none", "hourly", "daily"]).optional().describe("Keep alerting every hour or day until done."),
+    follow: z.enum(["none", "hourly", "daily", "weekly"]).optional().describe("Keep alerting every hour, day or week until done."),
+    follow_time: z.string().regex(/^\d{1,2}:\d{2}$/).nullable().optional().describe("For daily or weekly follow-ups: the time of day, HH:MM in the person's time zone."),
+    follow_dow: z.number().int().min(0).max(6).nullable().optional().describe("For weekly follow-ups: the day of the week, 0 = Sunday."),
     repeat: z.string().optional().describe("none, daily, weekdays, weekly, biweekly, monthly or yearly."),
     push: z.boolean().optional(),
     email: z.object({ inbox: z.string(), to: z.string() }).nullable().optional().describe("Also email this address when it goes off."),
@@ -433,7 +453,7 @@ export function registerNotifyTools(server) {
             if (cur && cur.appSig === x.sig && !(cur.done && !cur.doneFromPhone)) { Object.assign(cur, base); continue; }
             if (!(+new Date(x.due) > 0)) continue;
             state.reminders[x.id] = { ...(cur ? { queuedFor: cur.queuedFor ?? null } : {}), id: x.id, ...base, due: new Date(x.due).toISOString(),
-                lastNote: x.last_note ?? null, follow: x.follow ?? "none", repeat: x.repeat ?? "none", appSig: x.sig, done: false, snooze: null };
+                lastNote: x.last_note ?? null, follow: x.follow ?? "none", followTime: x.follow_time ?? null, followDow: x.follow_dow ?? null, repeat: x.repeat ?? "none", appSig: x.sig, done: false, snooze: null };
         }
         await save();
         await tick();

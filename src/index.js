@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import express from "express";
+import { compressReplies } from "./compress.js";
+import { enableDelta } from "./delta.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -34,6 +36,7 @@ const INSTRUCTIONS = "This server connects several separate email inboxes (Gmail
 
 function buildMcpServer() {
     const server = new McpServer({ name: "organized-chaos-mail", version: "1.0.0" }, { instructions: INSTRUCTIONS });
+    enableDelta(server);
     registerTools(server);
     registerCalendarTools(server);
     registerTextTools(server);
@@ -58,6 +61,8 @@ const provider = new OwnerAuthProvider();
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
+// Compress every reply when the caller accepts it (all modern clients do): mail data shrinks to a fraction.
+app.use(compressReplies);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 

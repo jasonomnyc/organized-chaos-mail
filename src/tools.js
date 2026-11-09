@@ -6,7 +6,8 @@ import { guessMime } from "./mime.js";
 /** Largest single file get_attachment hands back. */
 const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 export function ok(value) {
-    const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    // Compact JSON: the indented form was about a third bigger, and every byte the server sends counts as bandwidth.
+    const text = typeof value === "string" ? value : JSON.stringify(value);
     return { content: [{ type: "text", text }] };
 }
 function fail(err) {
